@@ -93,15 +93,31 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     gpu_sim.ReleaseMatrix(query);
     gpu_sim.MoveMatrixToGpuHbm(value_prefix);
 
-    Matrix *answer = answer_rows[0];
-    for (size_t row = 1; row <= i; ++row) {
-      Matrix *next_answer = matrix_memory_allocator.Allocate(
-          "answer_" + std::to_string(i) + "_" + std::to_string(row));
-      gpu_sim.Concat(answer, answer_rows[row], next_answer, 0, kInGpuHbm);
-      gpu_sim.ReleaseMatrix(answer);
-      gpu_sim.ReleaseMatrix(answer_rows[row]);
-      answer = next_answer;
+    // A balanced merge keeps HBM concatenation work O(n log n), instead of
+    // repeatedly copying an ever-growing prefix in an O(n^2) chain.
+    std::vector<Matrix *> answer_blocks = answer_rows;
+    size_t merge_level = 0;
+    while (answer_blocks.size() > 1) {
+      std::vector<Matrix *> next_blocks;
+      next_blocks.reserve((answer_blocks.size() + 1) / 2);
+      for (size_t block = 0; block < answer_blocks.size(); block += 2) {
+        if (block + 1 == answer_blocks.size()) {
+          next_blocks.push_back(answer_blocks[block]);
+          continue;
+        }
+        Matrix *merged = matrix_memory_allocator.Allocate(
+            "answer_" + std::to_string(i) + "_" +
+            std::to_string(merge_level) + "_" + std::to_string(block / 2));
+        gpu_sim.Concat(answer_blocks[block], answer_blocks[block + 1], merged,
+                       0, kInGpuHbm);
+        gpu_sim.ReleaseMatrix(answer_blocks[block]);
+        gpu_sim.ReleaseMatrix(answer_blocks[block + 1]);
+        next_blocks.push_back(merged);
+      }
+      answer_blocks = std::move(next_blocks);
+      ++merge_level;
     }
+    Matrix *answer = answer_blocks[0];
 
     gpu_sim.Run(false, &matrix_memory_allocator);
     rater.CommitAnswer(*answer);
