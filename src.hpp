@@ -9,36 +9,37 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
   assert(keys.size() == values.size());
 
   Matrix *key_prefix = nullptr;
-  Matrix *value_prefix = nullptr;
+  constexpr size_t kSramPrefixRounds = 22;
 
   for (size_t i = 0; i < keys.size(); ++i) {
     Matrix *query = rater.GetNextQuery();
 
-    // Keep the growing key prefix in SRAM.  The value prefix remains in HBM
-    // between rounds so it does not inflate SRAM while the key is rebuilt.
-    gpu_sim.MoveMatrixToSharedMem(keys[i]);
+    // Values stay as individual SRAM rows.  Small K prefixes also remain in
+    // SRAM; larger prefixes use HBM so rebuilding them cannot set the SRAM
+    // high-water mark.
+    gpu_sim.MoveMatrixToSharedMem(values[i]);
+    if (i < kSramPrefixRounds) {
+      gpu_sim.MoveMatrixToSharedMem(keys[i]);
+    }
+
+    Position key_position = i < kSramPrefixRounds ? kInSharedMemory
+                                                   : kInGpuHbm;
 
     if (i == 0) {
       key_prefix = keys[i];
-      value_prefix = values[i];
-      gpu_sim.Transpose(key_prefix, kInSharedMemory);
+      gpu_sim.Transpose(key_prefix, key_position);
     } else {
-      gpu_sim.Transpose(keys[i], kInSharedMemory);
+      gpu_sim.Transpose(keys[i], key_position);
       Matrix *next_key_prefix =
           matrix_memory_allocator.Allocate("key_prefix_" + std::to_string(i));
       gpu_sim.Concat(key_prefix, keys[i], next_key_prefix, 1,
-                     kInSharedMemory);
+                     key_position);
       gpu_sim.ReleaseMatrix(key_prefix);
       gpu_sim.ReleaseMatrix(keys[i]);
       key_prefix = next_key_prefix;
-
-      Matrix *next_value_prefix = matrix_memory_allocator.Allocate(
-          "value_prefix_" + std::to_string(i));
-      gpu_sim.Concat(value_prefix, values[i], next_value_prefix, 0,
-                     kInGpuHbm);
-      gpu_sim.ReleaseMatrix(value_prefix);
-      gpu_sim.ReleaseMatrix(values[i]);
-      value_prefix = next_value_prefix;
+    }
+    if (key_position == kInGpuHbm) {
+      gpu_sim.MoveMatrixToSharedMem(key_prefix);
     }
 
     // Compute Q K^T one row at a time.  Keeping Q in HBM and fetching the next
@@ -49,12 +50,9 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
         "query_row_" + std::to_string(i) + "_0");
     gpu_sim.GetRow(query, 0, query_rows[0], kInGpuHbm);
     gpu_sim.MoveMatrixToSharedMem(query_rows[0]);
-    // Queue V behind the first query row, allowing its transfer to overlap
-    // that row's substantially longer dot product.
-    gpu_sim.MoveMatrixToSharedMem(value_prefix);
 
-    std::vector<Matrix *> answer_rows;
-    answer_rows.reserve(i + 1);
+    std::vector<Matrix *> weight_rows;
+    weight_rows.reserve(i + 1);
     for (size_t row = 0; row <= i; ++row) {
       if (row < i) {
         query_rows[row + 1] = matrix_memory_allocator.Allocate(
@@ -82,16 +80,52 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       gpu_sim.MatDiv(exp_row, row_sum, normalized_row);
       gpu_sim.ReleaseMatrix(exp_row);
       gpu_sim.ReleaseMatrix(row_sum);
+      weight_rows.push_back(normalized_row);
+    }
+    gpu_sim.ReleaseMatrix(query);
 
-      Matrix *answer_row = matrix_memory_allocator.Allocate(
-          "answer_row_" + std::to_string(i) + "_" + std::to_string(row));
-      gpu_sim.MatMul(normalized_row, value_prefix, answer_row);
-      gpu_sim.ReleaseMatrix(normalized_row);
+    // Finish all score calculations before moving K back to HBM.  Output can
+    // then be formed with only the value rows resident in SRAM.
+    gpu_sim.Run(false, &matrix_memory_allocator);
+    if (i + 1 >= kSramPrefixRounds) {
+      gpu_sim.MoveMatrixToGpuHbm(key_prefix);
+      gpu_sim.Run(false, &matrix_memory_allocator);
+    }
+
+    // Scaling each value row by one scalar weight is algebraically identical
+    // to weights * V.  Under this simulator's size-product MatMul cost it is
+    // much cheaper than multiplying by the complete value matrix.
+    std::vector<Matrix *> answer_rows;
+    answer_rows.reserve(i + 1);
+    for (size_t row = 0; row <= i; ++row) {
+      Matrix *answer_row = nullptr;
+      for (size_t column = 0; column <= i; ++column) {
+        Matrix *weight = matrix_memory_allocator.Allocate(
+            "weight_" + std::to_string(i) + "_" + std::to_string(row) +
+            "_" + std::to_string(column));
+        Matrix *contribution = matrix_memory_allocator.Allocate(
+            "contribution_" + std::to_string(i) + "_" +
+            std::to_string(row) + "_" + std::to_string(column));
+        gpu_sim.GetColumn(weight_rows[row], column, weight, kInSharedMemory);
+        gpu_sim.MatMul(weight, values[column], contribution);
+        gpu_sim.ReleaseMatrix(weight);
+
+        if (answer_row == nullptr) {
+          answer_row = contribution;
+        } else {
+          Matrix *next_answer = matrix_memory_allocator.Allocate(
+              "answer_sum_" + std::to_string(i) + "_" +
+              std::to_string(row) + "_" + std::to_string(column));
+          gpu_sim.MatAdd(answer_row, contribution, next_answer);
+          gpu_sim.ReleaseMatrix(answer_row);
+          gpu_sim.ReleaseMatrix(contribution);
+          answer_row = next_answer;
+        }
+      }
+      gpu_sim.ReleaseMatrix(weight_rows[row]);
       gpu_sim.MoveMatrixToGpuHbm(answer_row);
       answer_rows.push_back(answer_row);
     }
-    gpu_sim.ReleaseMatrix(query);
-    gpu_sim.MoveMatrixToGpuHbm(value_prefix);
 
     // A balanced merge keeps HBM concatenation work O(n log n), instead of
     // repeatedly copying an ever-growing prefix in an O(n^2) chain.
