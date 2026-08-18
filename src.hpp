@@ -42,28 +42,60 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       gpu_sim.MoveMatrixToSharedMem(key_prefix);
     }
 
-    // Compute Q K^T one row at a time.  Keeping Q in HBM and fetching the next
-    // row before multiplying the current one pipelines its transfer with the
-    // expensive dot products and avoids storing all of Q in SRAM.
-    std::vector<Matrix *> query_rows(i + 1, nullptr);
-    query_rows[0] = matrix_memory_allocator.Allocate(
-        "query_row_" + std::to_string(i) + "_0");
-    gpu_sim.GetRow(query, 0, query_rows[0], kInGpuHbm);
-    gpu_sim.MoveMatrixToSharedMem(query_rows[0]);
+    // Q K^T is the sum of outer products of matching Q/K columns.  This keeps
+    // each score's floating-point accumulation order unchanged while avoiding
+    // the simulator's costly multiplication of two large operand buffers.
+    const size_t feature_count = query->GetColumnNum();
+    std::vector<Matrix *> query_columns(feature_count, nullptr);
+    query_columns[0] = matrix_memory_allocator.Allocate(
+        "query_column_" + std::to_string(i) + "_0");
+    gpu_sim.GetColumn(query, 0, query_columns[0], kInGpuHbm);
+    gpu_sim.MoveMatrixToSharedMem(query_columns[0]);
+
+    Matrix *scores = nullptr;
+    for (size_t feature = 0; feature < feature_count; ++feature) {
+      if (feature + 1 < feature_count) {
+        query_columns[feature + 1] = matrix_memory_allocator.Allocate(
+            "query_column_" + std::to_string(i) + "_" +
+            std::to_string(feature + 1));
+        gpu_sim.GetColumn(query, feature + 1, query_columns[feature + 1],
+                          kInGpuHbm);
+        gpu_sim.MoveMatrixToSharedMem(query_columns[feature + 1]);
+      }
+
+      Matrix *key_row = matrix_memory_allocator.Allocate(
+          "key_row_" + std::to_string(i) + "_" +
+          std::to_string(feature));
+      Matrix *outer_product = matrix_memory_allocator.Allocate(
+          "outer_product_" + std::to_string(i) + "_" +
+          std::to_string(feature));
+      gpu_sim.GetRow(key_prefix, feature, key_row, kInSharedMemory);
+      gpu_sim.MatMul(query_columns[feature], key_row, outer_product);
+      gpu_sim.ReleaseMatrix(query_columns[feature]);
+      gpu_sim.ReleaseMatrix(key_row);
+
+      if (scores == nullptr) {
+        scores = outer_product;
+      } else {
+        Matrix *next_scores = matrix_memory_allocator.Allocate(
+            "scores_" + std::to_string(i) + "_" +
+            std::to_string(feature));
+        gpu_sim.MatAdd(scores, outer_product, next_scores);
+        gpu_sim.ReleaseMatrix(scores);
+        gpu_sim.ReleaseMatrix(outer_product);
+        scores = next_scores;
+      }
+    }
+    gpu_sim.ReleaseMatrix(query);
+
+    Matrix *exp_scores =
+        matrix_memory_allocator.Allocate("exp_scores_" + std::to_string(i));
+    gpu_sim.MatExp(scores, exp_scores);
+    gpu_sim.ReleaseMatrix(scores);
 
     std::vector<Matrix *> weight_rows;
     weight_rows.reserve(i + 1);
     for (size_t row = 0; row <= i; ++row) {
-      if (row < i) {
-        query_rows[row + 1] = matrix_memory_allocator.Allocate(
-            "query_row_" + std::to_string(i) + "_" +
-            std::to_string(row + 1));
-        gpu_sim.GetRow(query, row + 1, query_rows[row + 1], kInGpuHbm);
-        gpu_sim.MoveMatrixToSharedMem(query_rows[row + 1]);
-      }
-
-      Matrix *score_row = matrix_memory_allocator.Allocate(
-          "score_row_" + std::to_string(i) + "_" + std::to_string(row));
       Matrix *exp_row = matrix_memory_allocator.Allocate(
           "exp_row_" + std::to_string(i) + "_" + std::to_string(row));
       Matrix *row_sum = matrix_memory_allocator.Allocate(
@@ -71,18 +103,14 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
       Matrix *normalized_row = matrix_memory_allocator.Allocate(
           "normalized_row_" + std::to_string(i) + "_" +
           std::to_string(row));
-
-      gpu_sim.MatMul(query_rows[row], key_prefix, score_row);
-      gpu_sim.ReleaseMatrix(query_rows[row]);
-      gpu_sim.MatExp(score_row, exp_row);
-      gpu_sim.ReleaseMatrix(score_row);
+      gpu_sim.GetRow(exp_scores, row, exp_row, kInSharedMemory);
       gpu_sim.Sum(exp_row, row_sum);
       gpu_sim.MatDiv(exp_row, row_sum, normalized_row);
       gpu_sim.ReleaseMatrix(exp_row);
       gpu_sim.ReleaseMatrix(row_sum);
       weight_rows.push_back(normalized_row);
     }
-    gpu_sim.ReleaseMatrix(query);
+    gpu_sim.ReleaseMatrix(exp_scores);
 
     // Finish all score calculations before moving K back to HBM.  Output can
     // then be formed with only the value rows resident in SRAM.
